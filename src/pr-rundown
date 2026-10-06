@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+#
+# pr-rundown: a morning summary of the GitHub pull requests waiting on you.
+# A terminal stand-in for GitHub's Slack/Teams "scheduled reminders".
+#
+# It shows:
+#   - PRs that need your review (requested from you, then from your teams)
+#   - PRs you reviewed that have new commits or replies since you last weighed in
+#   - Your own open PRs, grouped by where they stand
+#   - Unread @-mentions, with who mentioned you and a link to the comment
+#     (mentions that were later deleted or edited out are skipped)
+#
+# Needs: gh (signed in with `gh auth login`) and jq.
+# Works with the bash that ships on macOS (3.2) and on Linux.
+#
+# To see it once a day, the first time you open a terminal, add this line
+# to ~/.zshrc or ~/.bashrc:
+#     pr-rundown --daily
+#
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: pr-rundown [options]
+
+Options:
+  -o, --org ORG            Only include PRs in ORG (repeat for several orgs)
+  -x, --exclude-label L    Skip PRs carrying label L (repeatable)
+  -d, --drafts             Include draft PRs (skipped by default)
+      --days N             How far back to look for replies to your reviews (default 14)
+      --no-team            Leave out review requests that only went to a team
+      --no-mentions        Leave out the unread mentions section
+      --daily              Only print once per day (for your shell startup file)
+      --no-color           Plain output (also automatic with NO_COLOR or when piped)
+  -h, --help               Show this help
+EOF
+}
+
+die() { echo "pr-rundown: $*" >&2; exit 1; }
+
+# ---------- options ----------
+orgs="" scope="" labels="" drafts=0 days=14 teams=1 mentions=1 daily=0 want_color=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--org)           [ $# -ge 2 ] || die "$1 needs a value"; orgs="$orgs $2"; scope="$scope org:$2"; shift 2 ;;
+    -x|--exclude-label) [ $# -ge 2 ] || die "$1 needs a value"; labels="$labels -label:\"$2\""; shift 2 ;;
+    -d|--drafts)        drafts=1; shift ;;
+    --days)             [ $# -ge 2 ] || die "$1 needs a value"; days="$2"; shift 2 ;;
+    --no-team)          teams=0; shift ;;
+    --no-mentions)      mentions=0; shift ;;
+    --daily)            daily=1; shift ;;
+    --no-color)         want_color=0; shift ;;
+    -h|--help)          usage; exit 0 ;;
+    *)                  usage >&2; exit 2 ;;
+  esac
+done
+case "$days" in ''|*[!0-9]*) die "--days takes a whole number" ;; esac
+
+today=$(date +%Y-%m-%d)
+stamp="${XDG_CACHE_HOME:-$HOME/.cache}/pr-rundown/last-run"
+if [ "$daily" = 1 ] && [ "$(cat "$stamp" 2>/dev/null || true)" = "$today" ]; then
+  exit 0
+fi
+
+for cmd in gh jq; do
+  command -v "$cmd" >/dev/null 2>&1 || die "needs '$cmd' installed (macOS: brew install $cmd)"
+done
+
+color=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "$want_color" = 1 ]; then color=1; fi
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/pr-rundown.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+me=$(gh api user --jq .login 2>"$tmp/err") || {
+  cat "$tmp/err" >&2
+  die "couldn't reach GitHub as you. Run 'gh auth login' (or 'gh auth status' to check)."
+}
+
+# Start date for the "replies to your reviews" search (BSD date on macOS, GNU date on Linux).
+since_epoch=$(( $(date +%s) - days * 86400 ))
+since=$(date -u -r "$since_epoch" +%Y-%m-%d 2>/dev/null || date -u -d "@$since_epoch" +%Y-%m-%d)
+
+# ---------- searches (same syntax as the GitHub search box) ----------
+base="is:pr is:open archived:false${scope}${labels}"
+[ "$drafts" = 1 ] || base="$base draft:false"
+q_req="$base review-requested:$me sort:created-asc"
+q_reviewed="$base reviewed-by:$me -author:$me updated:>=$since sort:updated-desc"
+q_mine="$base author:$me sort:updated-desc"
+
+read -r -d '' QUERY <<'GRAPHQL' || true
+query($me: String!, $qReq: String!, $qReviewed: String!, $qMine: String!) {
+  req: search(query: $qReq, type: ISSUE, first: 50) { issueCount nodes { ...pr } }
+  reviewed: search(query: $qReviewed, type: ISSUE, first: 50) { issueCount nodes { ...pr } }
+  mine: search(query: $qMine, type: ISSUE, first: 50) { issueCount nodes { ...pr } }
+}
+fragment pr on PullRequest {
+  number title url isDraft createdAt updatedAt additions deletions reviewDecision
+  repository { nameWithOwner }
+  author { __typename login }
+  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+  reviewRequests(first: 20) {
+    nodes { requestedReviewer { __typename ... on User { login } ... on Team { combinedSlug } } }
+  }
+  latestOpinionatedReviews(first: 20) { nodes { state author { __typename login } } }
+  myReviews: reviews(author: $me, last: 1) { nodes { state submittedAt } }
+  timelineItems(last: 40, itemTypes: [REVIEW_REQUESTED_EVENT, PULL_REQUEST_COMMIT, PULL_REQUEST_REVIEW, ISSUE_COMMENT, HEAD_REF_FORCE_PUSHED_EVENT]) {
+    nodes {
+      __typename
+      ... on ReviewRequestedEvent { createdAt requestedReviewer { __typename ... on User { login } ... on Team { combinedSlug } } }
+      ... on PullRequestCommit { commit { committedDate } }
+      ... on PullRequestReview { submittedAt state author { __typename login } }
+      ... on IssueComment { createdAt author { __typename login } }
+      ... on HeadRefForcePushedEvent { createdAt actor { __typename login } }
+    }
+  }
+}
+GRAPHQL
+
+# gh exits non-zero when GitHub returns partial errors (for example an org that
+# requires SSO), but the rest of the data is still usable, so keep going if there is any.
+gh api graphql -f query="$QUERY" -f me="$me" -f qReq="$q_req" -f qReviewed="$q_reviewed" -f qMine="$q_mine" \
+  >"$tmp/prs.json" 2>"$tmp/err" || true
+if ! jq -e '.data' "$tmp/prs.json" >/dev/null 2>&1; then
+  cat "$tmp/err" "$tmp/prs.json" >&2 2>/dev/null || true
+  die "GitHub search failed."
+fi
+warnings=$(jq -r '[.errors[]?.message] | unique | .[]' "$tmp/prs.json")
+if [ -n "$warnings" ]; then
+  printf 'warning: %s\n' "$warnings" >&2
+  case "$warnings" in
+    *SAML*|*SSO*) echo "  -> Grant gh access to that org: https://github.com/settings/connections/applications/178c6fc778ccc68e1d6a" >&2 ;;
+  esac
+fi
+
+# A "mention" notification only says the thread mentioned you at some point, and
+# its timestamp is the thread's latest activity. So look each thread up: that gives
+# who mentioned you and when, and drops mentions that were since deleted or edited out.
+read -r -d '' MENTION_FRAGMENTS <<'GRAPHQL' || true
+fragment post on Comment { body createdAt lastEditedAt author { login } }
+fragment thread on IssueOrPullRequest {
+  ... on Issue { url ...post comments(last: 50) { totalCount nodes { url ...post } } }
+  ... on PullRequest {
+    url ...post
+    comments(last: 50) { totalCount nodes { url ...post } }
+    reviews(last: 30) { totalCount nodes { url submittedAt ...post comments(last: 30) { nodes { url ...post } } } }
+  }
+}
+GRAPHQL
+
+# Builds one GraphQL query with an aliased lookup per mention notification (up to 25)
+read -r -d '' MENTION_QUERY <<'JQ' || true
+($orgs | split(" ") | map(select(length > 0))) as $org_list
+| [ (if type == "array" then .[] else empty end)
+    | select(.reason == "mention" or .reason == "team_mention")
+    | select(.subject.type == "Issue" or .subject.type == "PullRequest")
+    | .repository.owner.login as $owner
+    | select(($org_list | length) == 0 or any($org_list[]; . == $owner))
+    | (try ((.subject.url // "") | split("/") | last | tonumber) catch null) as $num
+    | select($num != null)
+    | "  t\(.id): repository(owner: \($owner | @json), name: \(.repository.name | @json)) { issueOrPullRequest(number: \($num)) { ...thread } }" ]
+| .[:25]
+| if length == 0 then empty else "query {\n" + join("\n") + "\n}\n" + $fragments end
+JQ
+
+echo '[]' >"$tmp/notes.json"
+echo '{}' >"$tmp/threads.json"
+: >"$tmp/teams.txt"
+if [ "$mentions" = 1 ]; then
+  gh api 'notifications?participating=true&per_page=50' >"$tmp/notes.json" 2>/dev/null || echo '[]' >"$tmp/notes.json"
+  # Your teams, to check team mentions (needs gh's default read:org scope; skipped if missing)
+  gh api --paginate 'user/teams?per_page=100' --jq '.[] | "@" + .organization.login + "/" + .slug' \
+    >"$tmp/teams.txt" 2>/dev/null || : >"$tmp/teams.txt"
+  mention_query=$(jq -r --arg orgs "$orgs" --arg fragments "$MENTION_FRAGMENTS" "$MENTION_QUERY" "$tmp/notes.json" 2>/dev/null || true)
+  if [ -n "$mention_query" ]; then
+    gh api graphql -f query="$mention_query" >"$tmp/threads.json" 2>/dev/null || true
+    jq -e 'type == "object"' "$tmp/threads.json" >/dev/null 2>&1 || echo '{}' >"$tmp/threads.json"
+  fi
+fi
+
+# ---------- formatting ----------
+read -r -d '' RENDER <<'JQ' || true
+def esc($c): if $color == "1" then "\u001b[\($c)m" else "" end;
+def style($c): esc($c) + . + esc("0");
+def bold: style("1");
+def dim: style("2");
+def red: style("31");
+def green: style("32");
+def yellow: style("33");
+def cyan: style("36");
+
+# GitHub timestamps look like 2026-10-05T14:03:00Z (no regex needed, so any jq build works)
+def t: if . == null then null else (.[0:19] + "Z" | fromdateiso8601) end;
+def age: ((now - .) | if . < 0 then 0 else . end) as $s
+  | if $s < 3600 then "\(($s / 60) | floor)m"
+    elif $s < 86400 then "\(($s / 3600) | floor)h"
+    else "\(($s / 86400) | floor)d" end;
+def plural($n; $one; $many): "\($n) \(if $n == 1 then $one else $many end)";
+def plural($n; $one): plural($n; $one; $one + "s");
+def member($xs): . as $x | any($xs[]; . == $x);
+def is_bot: (.__typename == "Bot") or ((.login // "") | endswith("[bot]"));
+def key: "\(.repository.nameWithOwner)#\(.number)";
+def prs: [ .nodes[]? | select(. != null and .number != null) ];
+
+def size: "+\(.additions)/-\(.deletions)";
+def checks: (.commits.nodes[0].commit.statusCheckRollup.state // null) as $s
+  | if $s == "SUCCESS" then "checks passing" | green
+    elif $s == "FAILURE" or $s == "ERROR" then "checks failing" | red
+    elif $s == "PENDING" or $s == "EXPECTED" then "checks running" | yellow
+    else empty end;
+def draft: if .isDraft then "draft" | yellow else empty end;
+
+# The PR's timeline as [{kind, at, who, bot, reviewer}]
+def events:
+  [ .timelineItems.nodes[]? | select(. != null)
+    | if .__typename == "PullRequestCommit" then {kind: "commit", at: (.commit.committedDate | t), who: null, bot: false}
+      elif .__typename == "HeadRefForcePushedEvent" then {kind: "push", at: (.createdAt | t), who: .actor.login, bot: (.actor | is_bot)}
+      elif .__typename == "PullRequestReview" then {kind: "review", at: (.submittedAt | t), who: .author.login, bot: (.author | is_bot), state: .state}
+      elif .__typename == "IssueComment" then {kind: "comment", at: (.createdAt | t), who: .author.login, bot: (.author | is_bot)}
+      elif .__typename == "ReviewRequestedEvent" then {kind: "request", at: (.createdAt | t), reviewer: (.requestedReviewer.login // .requestedReviewer.combinedSlug)}
+      else empty end
+    | select(.at != null) ];
+
+def reviewers: [ .reviewRequests.nodes[]?.requestedReviewer | select(. != null) | {type: .__typename, name: (.login // .combinedSlug)} ];
+
+# When you last commented, reviewed or (on your own PRs) pushed
+def my_last($own):
+  ([ events[] | select(.kind != "request") | select(.who == $me or ($own and (.kind == "commit" or .kind == "push"))) | .at ]
+   + [ .myReviews.nodes[]?.submittedAt | t | select(. != null) ]) | max;
+
+# What other people (not bots) did after $since. Approvals and change requests are
+# listed only when $verdicts is true; on your own PRs the status line already shows them.
+def activity_since($since; $verdicts):
+  def who: map("@" + (.who // "ghost")) | unique | join(", ");
+  [ events[] | select(.at > $since and .kind != "request" and .who != $me and (.bot | not)) ] as $new
+  | ($new | map(select(.kind == "commit")) | length) as $commits
+  | ($new | map(select(.kind == "push")) | length) as $pushes
+  | ($new | map(select(.kind == "comment" or (.kind == "review" and .state == "COMMENTED")))) as $talk
+  | (if $verdicts then $new | map(select(.kind == "review" and .state == "APPROVED")) else [] end) as $approved
+  | (if $verdicts then $new | map(select(.kind == "review" and .state == "CHANGES_REQUESTED")) else [] end) as $changes
+  | { count: ($commits + $pushes + ($talk + $approved + $changes | length)),
+      text: ([ (if $commits > 0 then plural($commits; "new commit") else empty end),
+               (if $pushes > 0 and $commits == 0 then "force-pushed" else empty end),
+               (if ($talk | length) > 0 then plural($talk | length; "comment") + " from " + ($talk | who) else empty end),
+               (if ($approved | length) > 0 then "approved by " + ($approved | who) else empty end),
+               (if ($changes | length) > 0 then "changes requested by " + ($changes | who) else empty end)
+             ] | join("; ")) };
+
+# Does this text @-mention $h ("@login" or "@org/team", lowercase)? Mirrors GitHub's rule
+# that the handle can't sit inside a longer word or email address.
+def handle_chars: "abcdefghijklmnopqrstuvwxyz0123456789-_";
+def has_handle($h):
+  ((. // "") | ascii_downcase | split($h)) as $p
+  | any(range(1; $p | length);
+      ($p[. - 1][-1:]) as $before | ($p[.][0:1]) as $after
+      | ($before == "" or (handle_chars | index($before)) == null)
+        and ($after == "" or ((handle_chars + "/") | index($after)) == null));
+
+# Every post in a looked-up thread: the description, comments, reviews and review comments
+def posts:
+  [ ., (.comments.nodes[]?), (.reviews.nodes[]? | ., (.comments.nodes[]?)) ]
+  | map(select(. != null)
+        | {url, body, by: (.author.login // null),
+           at: ([(.submittedAt // .createdAt | t), (.lastEditedAt | t)] | map(select(. != null)) | max)}
+        | select(.at != null));
+
+# Notification helpers
+def note_num: (.subject.url // "") | split("/") | last;
+def note_kind: if .subject.type == "PullRequest" then "pull" elif .subject.type == "Issue" then "issues" else null end;
+def note_key: .repository.full_name + (if note_kind != null then "#" + note_num else "" end);
+def note_url: if note_kind != null and note_num != "" then "\(.repository.html_url)/\(note_kind)/\(note_num)" else .repository.html_url end;
+
+def item($details):
+  "  " + (key | cyan) + "  " + .title,
+  "      " + ([ $details[] | select(. != null and . != "") ] | join(" · ")),
+  "      " + (.url | dim);
+
+def section($title; $items; render):
+  if ($items | length) == 0 then empty
+  else "", ("\($title) (\($items | length))" | bold), ($items[] | render) end;
+
+def more($bucket):
+  ($bucket.nodes // [] | length) as $fetched
+  | if ($bucket.issueCount // 0) > $fetched
+    then "      " + ("…and \($bucket.issueCount - $fetched) more; narrow it down with --org" | dim)
+    else empty end;
+
+# ---------- buckets ----------
+(.data) as $d
+| ($d.req | prs) as $req_all
+| ($req_all | map(key)) as $req_keys
+
+# 1. Review requests: when the request reached you or your team, and whether it's a re-request
+| [ $req_all[] | . as $pr
+    | reviewers as $rv
+    | ($rv | any(.type == "User" and .name == $me)) as $personal
+    | ($rv | map(select(.type == "Team") | .name)) as $teams
+    | ($pr.createdAt | t) as $created
+    | ([ events[] | select(.kind == "request")
+         | select(.reviewer as $x | if $personal then $x == $me else ($x | member($teams)) end) | .at ]
+       | max // $created) as $since
+    | ($pr.myReviews.nodes[0].submittedAt | t) as $reviewed_at
+    | $pr + {personal: $personal, teams: $teams, waiting: $since,
+             rerequest: ($reviewed_at != null and $reviewed_at < $since)} ]
+  | sort_by(.waiting) as $req
+| ($req | map(select(.personal))) as $req_you
+| (if $show_teams == "1" then $req | map(select(.personal | not)) else [] end) as $req_team
+
+# 2. PRs you reviewed with something new from others since you last weighed in
+| [ $d.reviewed | prs | .[]
+    | select(key | member($req_keys) | not)
+    | . as $pr
+    | my_last(false) as $mine
+    | select($mine != null)
+    | activity_since($mine; true) as $act
+    | select($act.count > 0)
+    | $pr + {mine: $mine, act: $act,
+             review_state: ($pr.myReviews.nodes[0].state // null),
+             review_at: ($pr.myReviews.nodes[0].submittedAt | t)} ]
+  | sort_by(-(.updatedAt | t)) as $replies
+
+# 3. Your own PRs, most actionable first
+| [ $d.mine | prs | .[] | . as $pr
+    | [ .latestOpinionatedReviews.nodes[]? | select(.author != null and (.author | is_bot | not)) ] as $ops
+    | ($ops | map(select(.state == "CHANGES_REQUESTED") | "@" + .author.login)) as $blockers
+    | ($ops | map(select(.state == "APPROVED") | "@" + .author.login)) as $approvers
+    | ($pr.reviewDecision // (if ($blockers | length) > 0 then "CHANGES_REQUESTED"
+                              elif ($approvers | length) > 0 then "APPROVED" else null end)) as $decision
+    | (reviewers | map(if .type == "Team" then .name else "@" + .name end)) as $pending
+    | ([ events[] | select(.kind == "request") | .at ] | max // ($pr.createdAt | t)) as $asked
+    | my_last(true) as $mine
+    | (if $mine == null then {count: 0, text: ""} else activity_since($mine; false) end) as $act
+    | (if $decision == "CHANGES_REQUESTED" then 0 elif $act.count > 0 then 1
+       elif $decision == "APPROVED" then 2 elif ($pending | length) > 0 then 3 else 4 end) as $rank
+    | $pr + {decision: $decision, blockers: $blockers, approvers: $approvers,
+             pending: $pending, asked: $asked, act: $act, rank: $rank} ]
+  | sort_by(.rank, -(.updatedAt | t)) as $own
+
+# 4. Unread @-mentions, checked against what the thread says now
+| ($orgs | split(" ") | map(select(length > 0))) as $org_list
+| ($threads[0].data // {}) as $looked_up
+| ("@" + ($me | ascii_downcase)) as $my_handle
+| ($team_handles | ascii_downcase | split("\n") | map(select(length > 0))) as $my_teams
+| [ ($notes[0] // []) | if type == "array" then .[] else empty end
+    | select(.reason == "mention" or .reason == "team_mention")
+    | select(($org_list | length) == 0 or (.repository.owner.login | member($org_list)))
+    | . as $n
+    | ($looked_up["t" + (.id | tostring)].issueOrPullRequest // null) as $th
+    | if $th == null then $n + {status: "unchecked"}
+      else
+        ($th | posts) as $ps
+        | ([ $ps[] | select(.by == $me) | .at ] | max) as $my_last
+        | ([ $ps[] | select(.by != $me) | . as $p
+             | (if ($p.body | has_handle($my_handle)) then "you"
+                else [ $my_teams[] as $h | select($p.body | has_handle($h)) | $h ] | first end) as $whom
+             | select($whom != null) | $p + {whom: $whom} ] | max_by(.at)) as $hit
+        | (($th.comments.totalCount // 0) > 50 or ($th.reviews.totalCount // 0) > 30) as $partial
+        | if $hit != null then
+            # Already read, or you've replied since: nothing waiting
+            if ((.last_read_at | t) // 0) >= $hit.at or ($my_last // 0) > $hit.at then $n + {status: "seen"}
+            else $n + {status: "ok", hit: $hit} end
+          elif $partial or (.reason == "team_mention" and ($my_teams | length) == 0) then $n + {status: "unchecked"}
+          else $n + {status: "gone"} end
+      end ] as $checked
+| [ $checked[] | select(.status == "ok" or .status == "unchecked") ]
+  | sort_by(.hit.at // (.updated_at | t)) | reverse as $mentions
+| [ $checked[] | select(.status == "gone") ] as $gone
+
+| ($own | map(select(.rank <= 2)) | length) as $own_attention
+
+# ---------- output ----------
+| ("PR rundown for @\($me) · \($header)" | bold),
+  ([ (if ($req_you | length) > 0 then plural($req_you | length; "review") + " for you" else empty end),
+     (if ($req_team | length) > 0 then plural($req_team | length; "team review") else empty end),
+     (if ($replies | length) > 0 then plural($replies | length; "reply"; "replies") + " to your reviews" else empty end),
+     (if $own_attention > 0 then plural($own_attention; "of your PRs needs"; "of your PRs need") + " attention" else empty end),
+     (if ($mentions | length) > 0 then plural($mentions | length; "mention") else empty end)
+   ] | if length == 0 then "Nothing waiting on you." | green else join(" · ") end),
+
+  section("Needs your review"; $req_you;
+    .waiting as $w
+    | item([ "@" + (.author.login // "ghost"),
+             ((if .rerequest then "re-requested " + ($w | age) + " ago" else "waiting " + ($w | age) end)
+               | if (now - $w) > 2 * 86400 then yellow else . end),
+             size, checks, draft ])),
+  more($d.req),
+
+  section("Requested from your team"; $req_team;
+    item([ "@" + (.author.login // "ghost"),
+           "via " + (if (.teams | length) > 0 then .teams | join(", ") else "a team" end),
+           "waiting " + (.waiting | age),
+           size, checks, draft ])),
+
+  section("Replies to your reviews"; $replies;
+    ({"APPROVED": "you approved", "CHANGES_REQUESTED": "you requested changes",
+      "COMMENTED": "you commented", "DISMISSED": "your review was dismissed"}[.review_state // ""]
+      // "you commented") as $verb
+    | item([ "@" + (.author.login // "ghost"),
+             $verb + (if .review_at != null then " " + (.review_at | age) + " ago" else "" end),
+             ((if .review_at != null and .mine > .review_at then "since your last reply: " else "since then: " end) + .act.text | yellow) ])),
+  more($d.reviewed),
+
+  section("Your pull requests"; $own;
+    item([ (if .decision == "CHANGES_REQUESTED" then
+              ("changes requested" + (if (.blockers | length) > 0 then " by " + (.blockers | join(", ")) else "" end)) | red
+            elif .decision == "APPROVED" then
+              ("approved" + (if (.approvers | length) > 0 then " by " + (.approvers | join(", ")) else "" end)) | green
+            elif (.pending | length) > 0 then
+              "waiting on " + (.pending | join(", ")) + " for " + (.asked | age)
+            else "no reviewers requested" | yellow end),
+           (if .act.count > 0 then "new: " + .act.text | yellow else empty end),
+           checks, draft ])),
+  more($d.mine),
+
+  section("Unread mentions"; $mentions;
+    "  " + (note_key | cyan) + "  " + .subject.title,
+    "      " + (if .status == "ok" then
+                  "@" + (.hit.by // "ghost") + " mentioned " + (if .hit.whom == "you" then "you" else .hit.whom end)
+                  + " " + (.hit.at | age) + " ago"
+                else
+                  (if .reason == "team_mention" then "your team was mentioned" else "you were mentioned" end)
+                  + " (couldn't check when) · thread active " + (.updated_at | t | age) + " ago"
+                end),
+    "      " + ((if .status == "ok" then .hit.url else note_url end) | dim)),
+  (if ($gone | length) > 0 then
+     "", ("Skipped " + plural($gone | length; "mention notification") + " whose mention has been deleted or edited out: "
+          + ($gone | map(note_key) | join(", ")) | dim)
+   else empty end)
+JQ
+
+jq -r \
+  --arg me "$me" \
+  --arg color "$color" \
+  --arg show_teams "$teams" \
+  --arg orgs "$orgs" \
+  --arg header "$(date '+%a %e %b, %H:%M' | tr -s ' ')" \
+  --slurpfile notes "$tmp/notes.json" \
+  --slurpfile threads "$tmp/threads.json" \
+  --rawfile team_handles "$tmp/teams.txt" \
+  "$RENDER" "$tmp/prs.json"
+
+if [ "$daily" = 1 ]; then
+  mkdir -p "$(dirname "$stamp")" && echo "$today" >"$stamp"
+fi
